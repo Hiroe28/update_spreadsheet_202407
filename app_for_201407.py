@@ -4,18 +4,52 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import pytz
+import random
+from gspread.exceptions import APIError
 
 # Googleスプレッドシートの設定
 scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+
+# 再試行用の関数を定義
+def with_retry(func, max_retries=3, delay_base=2):
+    """
+    指定した関数を最大max_retries回まで再試行する
+    失敗するたびにdelay_base秒 * (ランダム要素 + 試行回数)だけ待機する
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except APIError as e:
+            if attempt == max_retries - 1:  # 最後の試行だった場合
+                raise e
+            # 待機時間を計算（バックオフ+ランダム化）
+            delay = delay_base * (1 + attempt) * (0.5 + random.random())
+            st.warning(f"API接続エラーが発生しました。{delay:.1f}秒後に再試行します。({attempt+1}/{max_retries})")
+            time.sleep(delay)
 
 # Streamlit secretsからcredentialsとSPREADSHEET_KEYを取得
 credentials_info = st.secrets["gcp_service_account"]
 spreadsheet_key = st.secrets["spreadsheet_key"]["spreadsheet_key"]
 credentials = Credentials.from_service_account_info(credentials_info, scopes=scope)
 gc = gspread.authorize(credentials)
-workbook = gc.open_by_key(spreadsheet_key)
-sheet = workbook.sheet1
-question_sheet = workbook.worksheet("質問")  # 質問シートを追加
+
+# スプレッドシートの初期化処理を関数化
+@st.cache_resource(ttl=3600)  # リソースをキャッシュして頻繁なAPIコールを減らす
+def initialize_workbook():
+    """スプレッドシートへの接続を確立し、ワークブックを返す"""
+    def _open_workbook():
+        return gc.open_by_key(spreadsheet_key)
+    
+    return with_retry(_open_workbook)
+
+# ワークブックを初期化
+try:
+    workbook = initialize_workbook()
+    sheet = workbook.sheet1
+    question_sheet = workbook.worksheet("質問")  # 質問シートを追加
+except Exception as e:
+    st.error(f"スプレッドシートへの接続中にエラーが発生しました: {str(e)}")
+    st.stop()
 
 # セッションステートの初期化
 if 'confirm_overwrite' not in st.session_state:
@@ -27,35 +61,68 @@ if 'confirm_overwrite' not in st.session_state:
 
 def update_sheet(username, question_num, answer):
     # スプレッドシートにデータを書き込む関数
-    cell = sheet.find(username)
-    if cell:
-        # ユーザー名が既に存在する場合、その行を更新
-        row_number = cell.row
-        existing_answer = sheet.cell(row_number, question_num + 1).value
-        if existing_answer:
-            st.session_state.confirm_overwrite = True
-            st.session_state.row_number = row_number
-            st.session_state.col_number = question_num + 1
-            st.session_state.answer = answer
-            st.session_state.existing_answer = existing_answer
+    def _find_user():
+        return sheet.find(username)
+    
+    try:
+        cell = with_retry(_find_user)
+        
+        if cell:
+            # ユーザー名が既に存在する場合、その行を更新
+            row_number = cell.row
+            
+            def _get_cell_value():
+                return sheet.cell(row_number, question_num + 1).value
+            
+            existing_answer = with_retry(_get_cell_value)
+            
+            if existing_answer:
+                st.session_state.confirm_overwrite = True
+                st.session_state.row_number = row_number
+                st.session_state.col_number = question_num + 1
+                st.session_state.answer = answer
+                st.session_state.existing_answer = existing_answer
+            else:
+                def _update_cell():
+                    sheet.update_cell(row_number, question_num + 1, answer)
+                
+                with_retry(_update_cell)
+                st.success("データをスプレッドシートに送信しました。")
         else:
-            sheet.update_cell(row_number, question_num + 1, answer)
+            # 新しいユーザーの場合、新しい行を追加
+            def _append_row():
+                # 列数を取得
+                col_count = len(sheet.row_values(1))
+                new_row = [username] + [''] * (col_count - 1)
+                sheet.append_row(new_row)
+                return sheet.find(username)
+            
+            new_cell = with_retry(_append_row)
+            row_number = new_cell.row
+            
+            def _update_new_cell():
+                sheet.update_cell(row_number, question_num + 1, answer)
+            
+            with_retry(_update_new_cell)
             st.success("データをスプレッドシートに送信しました。")
-    else:
-        # 新しいユーザーの場合、新しい行を追加
-        new_row = [username] + [''] * (sheet.col_count - 1)
-        sheet.append_row(new_row)
-        row_number = sheet.find(username).row
-        sheet.update_cell(row_number, question_num + 1, answer)
-        st.success("データをスプレッドシートに送信しました。")
+    
+    except Exception as e:
+        st.error(f"データの送信中にエラーが発生しました: {str(e)}")
 
 def add_question(name, question):
     # 現在の日時を東京タイムゾーンで取得
     tz = pytz.timezone('Asia/Tokyo')
     current_time = datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
+    
     # 質問シートにデータを書き込む関数
-    question_sheet.append_row([name, question, current_time])
-    st.success("質問をスプレッドシートに送信しました。")
+    def _append_question():
+        question_sheet.append_row([name, question, current_time])
+    
+    try:
+        with_retry(_append_question)
+        st.success("質問をスプレッドシートに送信しました。")
+    except Exception as e:
+        st.error(f"質問の送信中にエラーが発生しました: {str(e)}")
 
 # プルダウンメニューの選択肢を作成
 options = [
@@ -100,11 +167,18 @@ if st.session_state.confirm_overwrite:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("はい", key="yes"):
-            sheet.update_cell(st.session_state.row_number, st.session_state.col_number, st.session_state.answer)
-            st.success("データをスプレッドシートに上書きしました。")
-            time.sleep(2)
-            st.session_state.confirm_overwrite = False
-            st.rerun()  # ページをリロードしてUIを更新
+            def _overwrite_cell():
+                sheet.update_cell(st.session_state.row_number, st.session_state.col_number, st.session_state.answer)
+            
+            try:
+                with_retry(_overwrite_cell)
+                st.success("データをスプレッドシートに上書きしました。")
+                time.sleep(2)
+                st.session_state.confirm_overwrite = False
+                st.rerun()  # ページをリロードしてUIを更新
+            except Exception as e:
+                st.error(f"データの上書き中にエラーが発生しました: {str(e)}")
+    
     with col2:
         if st.button("いいえ", key="no"):
             st.info("操作がキャンセルされました。")
